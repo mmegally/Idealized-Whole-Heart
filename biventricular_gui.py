@@ -1,5 +1,5 @@
 """
-Interactive GUI for exploring the biventricular model.
+Interactive GUI for exploring the four-chamber heart model.
 
 This embeds a PyVista 3D viewport in a Qt application and exposes model
 parameters via sliders/spinboxes so you can see the geometry update live.
@@ -36,6 +36,7 @@ from biventricular_model import (
     offset_curve,
     rv_revolve_profile,
 )
+from four_chamber_model_proto import build_la_mesh, build_ra_mesh
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -245,6 +246,8 @@ class DisplayOptions:
     show_lv_epi: bool = True
     show_rv_endo: bool = True
     show_rv_epi: bool = True
+    show_la: bool = False
+    show_ra: bool = False
     show_profiles: bool = False
     show_axes: bool = True
     smooth_shading: bool = True
@@ -279,7 +282,7 @@ def _create_rv_mesh_from_lv_epi(
 class BiventricularViewer(QtWidgets.QMainWindow):
     def __init__(self, parent: Optional[QtWidgets.QWidget] = None) -> None:
         super().__init__(parent=parent)
-        self.setWindowTitle("Biventricular Model Explorer")
+        self.setWindowTitle("Four-Chamber Model Explorer")
         self.resize(1400, 850)
 
         pv.global_theme.allow_empty_mesh = True
@@ -291,9 +294,13 @@ class BiventricularViewer(QtWidgets.QMainWindow):
 
         self._actors: set[str] = set()
         self._implicit_actor_name = "implicit_surface"
+        self._la_actor_name = "la_shell"
+        self._ra_actor_name = "ra_shell"
         self._last_lv: Optional[dict] = None
         self._last_rv: Optional[dict] = None
         self._implicit_mesh: Optional[pv.PolyData] = None
+        self._la_mesh: Optional[pv.PolyData] = None
+        self._ra_mesh: Optional[pv.PolyData] = None
 
         self._mesh_update_timer = QtCore.QTimer(self)
         self._mesh_update_timer.setSingleShot(True)
@@ -303,7 +310,13 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         self._implicit_update_timer.setSingleShot(True)
         self._implicit_update_timer.timeout.connect(self._update_implicit_surface)
 
+        self._atria_update_timer = QtCore.QTimer(self)
+        self._atria_update_timer.setSingleShot(True)
+        self._atria_update_timer.timeout.connect(self._update_atria_surfaces)
+
         self._implicit_dirty = False
+        self._atria_dirty = False
+        self._atria_force_next = False
 
         central = QtWidgets.QWidget()
         self.setCentralWidget(central)
@@ -356,6 +369,7 @@ class BiventricularViewer(QtWidgets.QMainWindow):
 
         tabs.addTab(self._build_tab_parameters(), "Parameters")
         tabs.addTab(self._build_tab_control_points(), "LV Control Points")
+        tabs.addTab(self._build_tab_atria(), "Atria")
         tabs.addTab(self._build_tab_implicit(), "Implicit")
 
         container = QtWidgets.QWidget()
@@ -412,6 +426,10 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         self.cb_rv_endo.setChecked(True)
         self.cb_rv_epi = QtWidgets.QCheckBox("Show RV epicardium")
         self.cb_rv_epi.setChecked(True)
+        self.cb_la = QtWidgets.QCheckBox("Show LA (left atrium)")
+        self.cb_la.setChecked(False)
+        self.cb_ra = QtWidgets.QCheckBox("Show RA (right atrium)")
+        self.cb_ra.setChecked(False)
         self.cb_profiles = QtWidgets.QCheckBox("Show profile curves (x–z plane)")
         self.cb_profiles.setChecked(False)
         self.cb_axes = QtWidgets.QCheckBox("Show axes")
@@ -425,6 +443,8 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         display_layout.addWidget(self.cb_lv_epi)
         display_layout.addWidget(self.cb_rv_endo)
         display_layout.addWidget(self.cb_rv_epi)
+        display_layout.addWidget(self.cb_la)
+        display_layout.addWidget(self.cb_ra)
         display_layout.addWidget(self.cb_profiles)
         display_layout.addWidget(self.cb_axes)
         display_layout.addWidget(self.cb_smooth)
@@ -455,7 +475,7 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             self.rv_warp_scale,
             self.rv_wrap_deg,
         ):
-            w.valueChanged.connect(self._on_any_param_changed)
+            w.valueChanged.connect(self._on_ventricle_geometry_changed)
 
         for cb in (
             self.cb_lv_endo,
@@ -467,7 +487,10 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             self.cb_smooth,
             self.cb_wireframe,
         ):
-            cb.stateChanged.connect(self._on_any_param_changed)
+            cb.stateChanged.connect(self._on_display_changed)
+
+        self.cb_la.stateChanged.connect(self._on_atria_visibility_changed)
+        self.cb_ra.stateChanged.connect(self._on_atria_visibility_changed)
 
         self.btn_reset_all.clicked.connect(self._reset_all)
         self.btn_reset_camera.clicked.connect(self._reset_camera)
@@ -524,7 +547,7 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             cp_grid.addWidget(r_row, i + 1, 1)
             cp_grid.addWidget(z_row, i + 1, 2)
 
-            r_row.valueChanged.connect(self._on_any_param_changed)
+            r_row.valueChanged.connect(self._on_ventricle_geometry_changed)
             z_row.valueChanged.connect(self._on_control_point_z_changed)
 
         points_layout.addLayout(cp_grid)
@@ -540,6 +563,161 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         tab.setLayout(outer)
 
         self.btn_reset_cp.clicked.connect(self._reset_control_points)
+
+        return tab
+
+    def _build_tab_atria(self) -> QtWidgets.QWidget:
+        tab = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout()
+        outer.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        outer.addWidget(scroll)
+        tab.setLayout(outer)
+
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        content.setLayout(layout)
+
+        info = QtWidgets.QLabel(
+            "The atria (LA/RA) are generated as implicit voxel shells positioned relative to the\n"
+            "current LV/RV epicardial meshes. Smaller voxel spacing gives more detail but can be\n"
+            "slow. Enable LA/RA visibility in Parameters → Display."
+        )
+        info.setWordWrap(True)
+        layout.addWidget(info)
+
+        gen_box = QtWidgets.QGroupBox("Generation")
+        gen_layout = QtWidgets.QVBoxLayout()
+        gen_box.setLayout(gen_layout)
+
+        self.atria_spacing = FloatSliderRow(
+            "Voxel spacing",
+            0.02,
+            0.20,
+            0.05,
+            0.005,
+            decimals=3,
+            tooltip="Smaller = finer detail / slower",
+        )
+        gen_layout.addWidget(self.atria_spacing)
+
+        self.cb_auto_atria = QtWidgets.QCheckBox("Auto-update atria (slow)")
+        self.cb_auto_atria.setChecked(False)
+        gen_layout.addWidget(self.cb_auto_atria)
+
+        btns = QtWidgets.QHBoxLayout()
+        self.btn_update_atria = QtWidgets.QPushButton("Recompute atria now")
+        self.btn_reset_atria = QtWidgets.QPushButton("Reset atria params")
+        btns.addWidget(self.btn_update_atria)
+        btns.addWidget(self.btn_reset_atria)
+        gen_layout.addLayout(btns)
+
+        layout.addWidget(gen_box)
+
+        la_box = QtWidgets.QGroupBox("Left Atrium (LA)")
+        la_layout = QtWidgets.QVBoxLayout()
+        la_box.setLayout(la_layout)
+
+        self.la_r_scale_x = FloatSliderRow("LA radius scale (x)", 0.30, 1.40, 0.72, 0.01, decimals=2)
+        self.la_r_scale_y = FloatSliderRow("LA radius scale (y)", 0.30, 1.40, 0.62, 0.01, decimals=2)
+        self.la_r_scale_z = FloatSliderRow("LA radius scale (z)", 0.30, 1.60, 0.78, 0.01, decimals=2)
+        self.la_center_x = FloatSliderRow("LA center offset (x)", -0.20, 0.80, 0.28, 0.01, decimals=2)
+        self.la_center_y = FloatSliderRow("LA center offset (y)", 0.00, 1.20, 0.62, 0.01, decimals=2)
+        self.la_center_z = FloatSliderRow("LA center offset (z)", 0.00, 1.60, 0.72, 0.01, decimals=2)
+        self.la_av_plane = FloatSliderRow("LA AV-plane offset (abs)", 0.00, 0.50, 0.08, 0.01, decimals=2)
+        self.la_wall_thickness = FloatSliderRow("LA wall thickness (abs)", 0.02, 0.50, 0.16, 0.01, decimals=2)
+        self.la_clearance = FloatSliderRow("PV clearance", 0.50, 2.50, 1.25, 0.05, decimals=2)
+
+        for w in (
+            self.la_r_scale_x,
+            self.la_r_scale_y,
+            self.la_r_scale_z,
+            self.la_center_x,
+            self.la_center_y,
+            self.la_center_z,
+            self.la_av_plane,
+            self.la_wall_thickness,
+            self.la_clearance,
+        ):
+            la_layout.addWidget(w)
+
+        layout.addWidget(la_box)
+
+        ra_box = QtWidgets.QGroupBox("Right Atrium (RA)")
+        ra_layout = QtWidgets.QVBoxLayout()
+        ra_box.setLayout(ra_layout)
+
+        self.ra_r_scale_x = FloatSliderRow("RA radius scale (x)", 0.30, 1.40, 0.74, 0.01, decimals=2)
+        self.ra_r_scale_y = FloatSliderRow("RA radius scale (y)", 0.30, 1.40, 0.64, 0.01, decimals=2)
+        self.ra_r_scale_z = FloatSliderRow("RA radius scale (z)", 0.30, 1.60, 0.82, 0.01, decimals=2)
+        self.ra_center_x = FloatSliderRow("RA center offset (x)", -0.20, 0.80, 0.18, 0.01, decimals=2)
+        self.ra_center_y = FloatSliderRow("RA center offset (y)", 0.00, 1.20, 0.44, 0.01, decimals=2)
+        self.ra_center_z = FloatSliderRow("RA center offset (z)", 0.00, 1.60, 0.85, 0.01, decimals=2)
+        self.ra_av_plane = FloatSliderRow("RA AV-plane offset (abs)", 0.00, 0.50, 0.06, 0.01, decimals=2)
+        self.ra_wall_thickness = FloatSliderRow("RA wall thickness (abs)", 0.02, 0.50, 0.18, 0.01, decimals=2)
+        self.ra_la_clearance = FloatSliderRow("RA–LA clearance (×R_base)", 0.00, 0.50, 0.10, 0.01, decimals=2)
+
+        self.ra_vc_len_sup = FloatSliderRow("SVC length (×R_base)", 0.50, 3.00, 1.70, 0.05, decimals=2)
+        self.ra_vc_len_inf = FloatSliderRow("IVC length (×R_base)", 0.50, 3.00, 1.50, 0.05, decimals=2)
+        self.ra_tilt_inf = FloatSliderRow("IVC tilt (deg)", 0.0, 80.0, 45.0, 1.0, decimals=0)
+        self.ra_posterior_bias = FloatSliderRow("Posterior bias (deg)", 0.0, 45.0, 18.0, 1.0, decimals=0)
+
+        for w in (
+            self.ra_r_scale_x,
+            self.ra_r_scale_y,
+            self.ra_r_scale_z,
+            self.ra_center_x,
+            self.ra_center_y,
+            self.ra_center_z,
+            self.ra_av_plane,
+            self.ra_wall_thickness,
+            self.ra_la_clearance,
+            self.ra_vc_len_sup,
+            self.ra_vc_len_inf,
+            self.ra_tilt_inf,
+            self.ra_posterior_bias,
+        ):
+            ra_layout.addWidget(w)
+
+        layout.addWidget(ra_box)
+        layout.addStretch(1)
+
+        for w in (
+            self.atria_spacing,
+            self.la_r_scale_x,
+            self.la_r_scale_y,
+            self.la_r_scale_z,
+            self.la_center_x,
+            self.la_center_y,
+            self.la_center_z,
+            self.la_av_plane,
+            self.la_wall_thickness,
+            self.la_clearance,
+            self.ra_r_scale_x,
+            self.ra_r_scale_y,
+            self.ra_r_scale_z,
+            self.ra_center_x,
+            self.ra_center_y,
+            self.ra_center_z,
+            self.ra_av_plane,
+            self.ra_wall_thickness,
+            self.ra_la_clearance,
+            self.ra_vc_len_sup,
+            self.ra_vc_len_inf,
+            self.ra_tilt_inf,
+            self.ra_posterior_bias,
+        ):
+            w.valueChanged.connect(self._on_atria_params_changed)
+
+        self.cb_auto_atria.stateChanged.connect(self._on_atria_params_changed)
+        self.btn_update_atria.clicked.connect(self._force_atria_update)
+        self.btn_reset_atria.clicked.connect(self._reset_atria_params)
 
         return tab
 
@@ -593,10 +771,10 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         tab.setLayout(outer)
 
         # Signals
-        self.cb_show_implicit.stateChanged.connect(self._on_any_param_changed)
-        self.combo_implicit_type.currentIndexChanged.connect(self._on_any_param_changed)
-        self.implicit_resolution.valueChanged.connect(self._on_any_param_changed)
-        self.cb_auto_implicit.stateChanged.connect(self._on_any_param_changed)
+        self.cb_show_implicit.stateChanged.connect(self._on_implicit_params_changed)
+        self.combo_implicit_type.currentIndexChanged.connect(self._on_implicit_params_changed)
+        self.implicit_resolution.valueChanged.connect(self._on_implicit_params_changed)
+        self.cb_auto_implicit.stateChanged.connect(self._on_implicit_params_changed)
         self.btn_update_implicit.clicked.connect(self._force_implicit_update)
         self.btn_export_stl.clicked.connect(self._export_implicit_stl)
         self.btn_screenshot.clicked.connect(self._save_screenshot)
@@ -613,6 +791,8 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             show_lv_epi=self.cb_lv_epi.isChecked(),
             show_rv_endo=self.cb_rv_endo.isChecked(),
             show_rv_epi=self.cb_rv_epi.isChecked(),
+            show_la=self.cb_la.isChecked(),
+            show_ra=self.cb_ra.isChecked(),
             show_profiles=self.cb_profiles.isChecked(),
             show_axes=self.cb_axes.isChecked(),
             smooth_shading=self.cb_smooth.isChecked(),
@@ -642,18 +822,44 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             return
         z0 = float(self._cp_z[0].value())
         self._cp_z[1].setValue(z0)
-        self._on_any_param_changed()
+        self._on_ventricle_geometry_changed()
 
-    def _on_any_param_changed(self, *_args) -> None:
+    def _on_ventricle_geometry_changed(self, *_args) -> None:
+        if self.cb_show_implicit.isChecked() and self.cb_auto_implicit.isChecked():
+            self._implicit_dirty = True
+        self._atria_dirty = True
+        self._schedule_mesh_update()
+
+    def _on_display_changed(self, *_args) -> None:
+        self._schedule_mesh_update()
+
+    def _on_implicit_params_changed(self, *_args) -> None:
         if self.cb_show_implicit.isChecked() and self.cb_auto_implicit.isChecked():
             self._implicit_dirty = True
         self._schedule_mesh_update()
+
+    def _on_atria_visibility_changed(self, state: int) -> None:
+        if state:
+            self._atria_dirty = True
+            self._atria_force_next = True
+        self._schedule_mesh_update()
+
+    def _on_atria_params_changed(self, *_args) -> None:
+        self._atria_dirty = True
+        if self.cb_auto_atria.isChecked() and (self.cb_la.isChecked() or self.cb_ra.isChecked()):
+            if self._last_lv is None or self._last_rv is None:
+                self._schedule_mesh_update()
+            else:
+                self._schedule_atria_update()
 
     def _schedule_mesh_update(self) -> None:
         self._mesh_update_timer.start(60)
 
     def _schedule_implicit_update(self) -> None:
         self._implicit_update_timer.start(250)
+
+    def _schedule_atria_update(self) -> None:
+        self._atria_update_timer.start(350)
 
     # -------------------------
     # Rendering
@@ -763,6 +969,40 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             self._remove_actor("profile_lv")
             self._remove_actor("profile_rv")
 
+        want_la = options.show_la
+        want_ra = options.show_ra
+
+        if want_la and self._la_mesh is not None:
+            self._set_actor_mesh(
+                self._la_actor_name,
+                self._la_mesh,
+                color="goldenrod",
+                opacity=0.55,
+                smooth_shading=smooth,
+                style="wireframe" if wireframe else "surface",
+            )
+        else:
+            self._remove_actor(self._la_actor_name)
+
+        if want_ra and self._ra_mesh is not None:
+            self._set_actor_mesh(
+                self._ra_actor_name,
+                self._ra_mesh,
+                color="darkviolet",
+                opacity=0.55,
+                smooth_shading=smooth,
+                style="wireframe" if wireframe else "surface",
+            )
+        else:
+            self._remove_actor(self._ra_actor_name)
+
+        if (want_la and self._la_mesh is None) or (want_ra and self._ra_mesh is None):
+            self._atria_dirty = True
+            self._atria_force_next = True
+
+        if (want_la or want_ra) and ((self._atria_dirty and self.cb_auto_atria.isChecked()) or self._atria_force_next):
+            self._schedule_atria_update()
+
         if not self.cb_show_implicit.isChecked():
             self._remove_actor(self._implicit_actor_name)
             self._implicit_mesh = None
@@ -770,11 +1010,147 @@ class BiventricularViewer(QtWidgets.QMainWindow):
             self._implicit_dirty = False
             self._schedule_implicit_update()
 
-        self._status.setText(
-            f"LV epi: {lv['epi_mesh'].n_points} pts, RV epi: {rv['epi_mesh'].n_points} pts"
-            + (" | implicit: on" if self.cb_show_implicit.isChecked() else "")
-        )
+        status_parts = [f"LV epi: {lv['epi_mesh'].n_points} pts", f"RV epi: {rv['epi_mesh'].n_points} pts"]
+        if want_la:
+            status_parts.append(f"LA: {self._la_mesh.n_points} pts" if self._la_mesh is not None else "LA: pending")
+        if want_ra:
+            status_parts.append(f"RA: {self._ra_mesh.n_points} pts" if self._ra_mesh is not None else "RA: pending")
+        if self.cb_show_implicit.isChecked():
+            status_parts.append("implicit: on")
+        self._status.setText(" | ".join(status_parts))
 
+        self.plotter.render()
+
+    def _force_atria_update(self) -> None:
+        if not (self.cb_la.isChecked() or self.cb_ra.isChecked()):
+            QtWidgets.QMessageBox.information(
+                self,
+                "Recompute atria",
+                "Enable 'Show LA' and/or 'Show RA' in Parameters → Display to compute the atria.",
+            )
+            return
+
+        try:
+            self._atria_update_timer.stop()
+        except Exception:
+            pass
+
+        self._atria_dirty = True
+
+        # Ensure we are using the latest LV/RV geometry before generating atria.
+        self._update_meshes()
+
+        try:
+            self._atria_update_timer.stop()
+        except Exception:
+            pass
+
+        self._update_atria_surfaces()
+
+    def _update_atria_surfaces(self) -> None:
+        want_la = self.cb_la.isChecked()
+        want_ra = self.cb_ra.isChecked()
+        if not (want_la or want_ra):
+            self._remove_actor(self._la_actor_name)
+            self._remove_actor(self._ra_actor_name)
+            self._atria_dirty = False
+            self._atria_force_next = False
+            return
+
+        if self._last_lv is None or self._last_rv is None:
+            return
+
+        lv = self._last_lv
+        rv = self._last_rv
+
+        spacing = float(self.atria_spacing.value())
+
+        self._status.setText("Computing atria (LA/RA)…")
+        QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.CursorShape.WaitCursor)
+        try:
+            la_mesh = None
+            ra_mesh = None
+
+            if want_la:
+                la_mesh = build_la_mesh(
+                    lv_result=lv,
+                    rv_result=rv,
+                    spacing=spacing,
+                    r_scale_xy=(float(self.la_r_scale_x.value()), float(self.la_r_scale_y.value())),
+                    r_scale_z=float(self.la_r_scale_z.value()),
+                    center_offset_xy=(float(self.la_center_x.value()), float(self.la_center_y.value())),
+                    center_offset_z=float(self.la_center_z.value()),
+                    av_plane_offset=float(self.la_av_plane.value()),
+                    wall_thickness=float(self.la_wall_thickness.value()),
+                    clearance=float(self.la_clearance.value()),
+                )
+
+            if want_ra:
+                ra_mesh = build_ra_mesh(
+                    lv_result=lv,
+                    rv_result=rv,
+                    la_mesh=la_mesh,
+                    spacing=spacing,
+                    r_scale_xy=(float(self.ra_r_scale_x.value()), float(self.ra_r_scale_y.value())),
+                    r_scale_z=float(self.ra_r_scale_z.value()),
+                    center_offset_xy=(float(self.ra_center_x.value()), float(self.ra_center_y.value())),
+                    center_offset_z=float(self.ra_center_z.value()),
+                    av_plane_offset=float(self.ra_av_plane.value()),
+                    wall_thickness=float(self.ra_wall_thickness.value()),
+                    la_clearance=float(self.ra_la_clearance.value()),
+                    vc_length_sup=float(self.ra_vc_len_sup.value()),
+                    vc_length_inf=float(self.ra_vc_len_inf.value()),
+                    tilt_deg_inf=float(self.ra_tilt_inf.value()),
+                    posterior_bias_deg=float(self.ra_posterior_bias.value()),
+                )
+        except Exception as exc:
+            self._status.setText(f"Atria error: {exc}")
+            return
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        if want_la and la_mesh is not None:
+            self._la_mesh = la_mesh
+        if want_ra and ra_mesh is not None:
+            self._ra_mesh = ra_mesh
+
+        self._atria_dirty = False
+        self._atria_force_next = False
+
+        options = self._display_options()
+        wireframe = options.wireframe
+        smooth = options.smooth_shading and not wireframe
+
+        if want_la and self._la_mesh is not None:
+            self._set_actor_mesh(
+                self._la_actor_name,
+                self._la_mesh,
+                color="goldenrod",
+                opacity=0.55,
+                smooth_shading=smooth,
+                style="wireframe" if wireframe else "surface",
+            )
+        else:
+            self._remove_actor(self._la_actor_name)
+
+        if want_ra and self._ra_mesh is not None:
+            self._set_actor_mesh(
+                self._ra_actor_name,
+                self._ra_mesh,
+                color="darkviolet",
+                opacity=0.55,
+                smooth_shading=smooth,
+                style="wireframe" if wireframe else "surface",
+            )
+        else:
+            self._remove_actor(self._ra_actor_name)
+
+        parts = []
+        if want_la and self._la_mesh is not None:
+            parts.append(f"LA: {self._la_mesh.n_points} pts")
+        if want_ra and self._ra_mesh is not None:
+            parts.append(f"RA: {self._ra_mesh.n_points} pts")
+        self._status.setText("Atria updated" + (f" ({', '.join(parts)})" if parts else ""))
         self.plotter.render()
 
     def _force_implicit_update(self) -> None:
@@ -929,6 +1305,42 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         self._cp_z[1].setValue(float(self._default_cp[0, 1]))
         self._schedule_mesh_update()
 
+    def _reset_atria_params(self) -> None:
+        self.atria_spacing.setValue(0.05)
+
+        self.la_r_scale_x.setValue(0.72)
+        self.la_r_scale_y.setValue(0.62)
+        self.la_r_scale_z.setValue(0.78)
+        self.la_center_x.setValue(0.28)
+        self.la_center_y.setValue(0.62)
+        self.la_center_z.setValue(0.72)
+        self.la_av_plane.setValue(0.08)
+        self.la_wall_thickness.setValue(0.16)
+        self.la_clearance.setValue(1.25)
+
+        self.ra_r_scale_x.setValue(0.74)
+        self.ra_r_scale_y.setValue(0.64)
+        self.ra_r_scale_z.setValue(0.82)
+        self.ra_center_x.setValue(0.18)
+        self.ra_center_y.setValue(0.44)
+        self.ra_center_z.setValue(0.85)
+        self.ra_av_plane.setValue(0.06)
+        self.ra_wall_thickness.setValue(0.18)
+        self.ra_la_clearance.setValue(0.10)
+
+        self.ra_vc_len_sup.setValue(1.70)
+        self.ra_vc_len_inf.setValue(1.50)
+        self.ra_tilt_inf.setValue(45.0)
+        self.ra_posterior_bias.setValue(18.0)
+
+        self._atria_dirty = True
+        if self.cb_la.isChecked() or self.cb_ra.isChecked():
+            self._atria_force_next = True
+            if self._last_lv is None or self._last_rv is None:
+                self._schedule_mesh_update()
+            else:
+                self._schedule_atria_update()
+
     def _reset_all(self) -> None:
         self.lv_wall.setValue(0.50)
         self.rv_wall.setValue(0.25)
@@ -943,10 +1355,25 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         self.cb_lv_epi.setChecked(True)
         self.cb_rv_endo.setChecked(True)
         self.cb_rv_epi.setChecked(True)
+        self.cb_la.setChecked(False)
+        self.cb_ra.setChecked(False)
         self.cb_profiles.setChecked(False)
         self.cb_axes.setChecked(True)
         self.cb_smooth.setChecked(True)
         self.cb_wireframe.setChecked(False)
+
+        self.cb_auto_atria.setChecked(False)
+        self._reset_atria_params()
+        self._la_mesh = None
+        self._ra_mesh = None
+        self._atria_dirty = False
+        self._atria_force_next = False
+        self._remove_actor(self._la_actor_name)
+        self._remove_actor(self._ra_actor_name)
+        try:
+            self._atria_update_timer.stop()
+        except Exception:
+            pass
 
         self.cb_show_implicit.setChecked(False)
         self.cb_auto_implicit.setChecked(False)
@@ -996,6 +1423,7 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         try:
             self._mesh_update_timer.stop()
             self._implicit_update_timer.stop()
+            self._atria_update_timer.stop()
         except Exception:
             pass
         try:
