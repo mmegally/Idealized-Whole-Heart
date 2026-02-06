@@ -25,12 +25,19 @@ from biventricular_model import (
 )
 
 
-def prepare_mesh_for_distance(mesh: pv.PolyData) -> pv.PolyData:
+def prepare_mesh_for_distance(
+    mesh: pv.PolyData,
+    *,
+    cap_openings: bool = True,
+    hole_size: float = 1000.0,
+) -> pv.PolyData:
     """
     Prepare a mesh for distance computations by triangulating and cleaning.
 
     Args:
         mesh: Input PyVista mesh
+        cap_openings: if True, cap open boundaries so signed distance is well-defined
+        hole_size: maximum hole size to fill when capping (in world units)
 
     Returns:
         Cleaned, triangulated mesh with normals
@@ -39,6 +46,11 @@ def prepare_mesh_for_distance(mesh: pv.PolyData) -> pv.PolyData:
     mesh = mesh.triangulate()
     # Clean up degenerate cells and duplicate points
     mesh = mesh.clean()
+    # The analytic meshes in this repo are truncated and therefore not watertight.
+    # Signed distance / implicit fields for non-closed surfaces can generate a
+    # spurious "closure" at the structured-grid bounds during marching cubes.
+    if cap_openings:
+        mesh = mesh.fill_holes(hole_size).clean()
     # Compute normals
     mesh = mesh.compute_normals(auto_orient_normals=True)
     return mesh
