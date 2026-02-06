@@ -19,6 +19,8 @@ Run:
 from __future__ import annotations
 
 import sys
+import os
+import platform
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -281,6 +283,7 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         self.resize(1400, 850)
 
         pv.global_theme.allow_empty_mesh = True
+        self._shown_once = False
 
         self._default_cp = create_lv_default_control_points()
         self._cp_r: list[FloatSliderRow] = []
@@ -313,9 +316,14 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         controls = self._build_controls()
         splitter.addWidget(controls)
 
-        self.plotter = QtInteractor(central)
+        # Create the VTK/Qt widget with its final parent up-front.
+        # Re-parenting a QVTKRenderWindowInteractor (which QtInteractor wraps)
+        # can trigger X11 "BadWindow" errors on some setups.
+        # Disable QtInteractor's internal auto-update timer. That timer can
+        # trigger renders before the widget has a valid native window on some
+        # X11 setups, leading to BadWindow errors.
+        self.plotter = QtInteractor(splitter, auto_update=False)
         self.plotter.set_background("white")
-        self.plotter.enable_anti_aliasing("ssaa")
         splitter.addWidget(self.plotter)
 
         splitter.setStretchFactor(0, 0)
@@ -325,11 +333,23 @@ class BiventricularViewer(QtWidgets.QMainWindow):
         self._status = QtWidgets.QLabel("Ready")
         self.statusBar().addPermanentWidget(self._status, stretch=1)
 
-        self._schedule_mesh_update()
-
     # -------------------------
     # UI construction
     # -------------------------
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        if self._shown_once:
+            return
+        self._shown_once = True
+        try:
+            self.plotter.enable_anti_aliasing("ssaa")
+        except Exception:
+            try:
+                self.plotter.enable_anti_aliasing("fxaa")
+            except Exception:
+                pass
+        self._schedule_mesh_update()
 
     def _build_controls(self) -> QtWidgets.QWidget:
         tabs = QtWidgets.QTabWidget()
@@ -974,6 +994,11 @@ class BiventricularViewer(QtWidgets.QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
         try:
+            self._mesh_update_timer.stop()
+            self._implicit_update_timer.stop()
+        except Exception:
+            pass
+        try:
             self.plotter.close()
         except Exception:
             pass
@@ -981,6 +1006,13 @@ class BiventricularViewer(QtWidgets.QMainWindow):
 
 
 def main() -> int:
+    # VTK's Qt interactor relies on an X11 window ID. Under a Wayland session,
+    # Qt may run with the "wayland" platform plugin even when DISPLAY is set,
+    # which can yield X11 BadWindow errors when VTK tries to configure the
+    # render window. Prefer X11 via xcb unless the user explicitly overrides.
+    if platform.system() == "Linux" and os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("QT_QPA_PLATFORM"):
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     win = BiventricularViewer()
     win.show()
