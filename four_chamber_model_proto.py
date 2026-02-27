@@ -94,6 +94,7 @@ def compute_curve_normals(tangents: np.ndarray) -> np.ndarray:
     """
     normals = np.zeros_like(tangents)
 
+
     for i in range(len(tangents)):
         dr, dz = tangents[i]
 
@@ -259,6 +260,81 @@ def rv_revolve_profile(
     return mesh
 
 
+def ellipsoid_surface_point(cx, cy, cz0, ax, by, cz, u: float, v: float) -> np.ndarray:
+    """
+    Parametric ellipsoid point.
+    u in [0, 2pi): azimuth about z
+    v in [-pi/2, pi/2]: elevation (like latitude)
+    """
+    cu, su = np.cos(u), np.sin(u)
+    cv, sv = np.cos(v), np.sin(v)
+
+    x = cx + ax * cv * cu
+    y = cy + by * cv * su
+    z = cz0 + cz * sv
+    return np.array([x, y, z], dtype=np.float32)
+
+
+def ellipsoid_outward_normal_at_point(cx, cy, cz0, ax, by, cz, p: np.ndarray) -> np.ndarray:
+    """
+    Outward normal of ellipsoid at point p on its surface using gradient of
+    F=(x-cx)^2/ax^2 + (y-cy)^2/by^2 + (z-cz0)^2/cz^2 - 1.
+    n ~ grad(F).
+    """
+    x, y, z = p
+    nx = 2.0 * (x - cx) / (ax * ax)
+    ny = 2.0 * (y - cy) / (by * by)
+    nz = 2.0 * (z - cz0) / (cz * cz)
+    n = np.array([nx, ny, nz], dtype=np.float32)
+    nrm = np.linalg.norm(n)
+    if nrm < 1e-12:
+        return np.array([0, 0, 1], dtype=np.float32)
+    return n / nrm
+
+def add_cylinders_to_mask(
+    grid: "pv.ImageData",
+    base_mask: np.ndarray,
+    cylinders: list[tuple[np.ndarray, np.ndarray]],
+    radius: float,
+    length: float,
+) -> np.ndarray:
+    """
+    Union filled cylinders into base_mask.
+    Each cylinder defined by (p0, axis) where axis must be unit length.
+    """
+    X = grid.points[:, 0]
+    Y = grid.points[:, 1]
+    Z = grid.points[:, 2]
+
+    mask = base_mask.copy()
+    r2max = radius * radius
+
+    for p0, axis in cylinders:
+        axis = np.asarray(axis, dtype=np.float32)
+        axis /= max(np.linalg.norm(axis), 1e-12)
+        p0 = np.asarray(p0, dtype=np.float32)
+
+        vx = X - p0[0]
+        vy = Y - p0[1]
+        vz = Z - p0[2]
+
+        # project onto axis segment [0, length]
+        w_dot_a = vx * axis[0] + vy * axis[1] + vz * axis[2]
+        t = np.clip(w_dot_a / length, 0.0, 1.0)
+
+        cxp = p0[0] + t * length * axis[0]
+        cyp = p0[1] + t * length * axis[1]
+        czp = p0[2] + t * length * axis[2]
+
+        dx = X - cxp
+        dy = Y - cyp
+        dz = Z - czp
+        r2 = dx * dx + dy * dy + dz * dz
+
+        mask |= (r2 <= r2max)
+
+    return mask
+
 def create_lv_default_control_points() -> np.ndarray:
     """
     Create default control points for LV endocardial profile.
@@ -382,137 +458,58 @@ def create_rv_mesh(
         'epi_normals': epi_normals,
     }
 
-def build_la_mesh(
-    lv_result: dict,
-    rv_result: dict,
-    spacing: float = 0.05,  # Voxel grid spacing
-    # LA shape (ellipsoid radii):
-    r_scale_xy: tuple[float, float] = (0.72, 0.62),  # (x_radius, y_radius)
-    r_scale_z: float = 0.78,  # z_radius
-    # LA placement relative to LV base
-    center_offset_xy: tuple[float, float] = (0.28, 0.62),  # LA placement relative to LV base (x, y) [R_base]
-    center_offset_z: float = 0.72,
-    av_plane_offset: float = 0.08,  # Define minimum for LA (along z-direction)
-    wall_thickness: float = 0.16,  # Wall thickness (for inner shell)
-    clearance: float = 1.25,  # Spacing between the pulmonary veins
-    # Placement of tubes relative to LA centroid (x,y):
-    x_side: float = 0.54,
-    y_bias: float = -0.34,
-) -> pv.PolyData:
-    """
-    Build a Left Atrium (LA) as an implicit ellipsoidal shell that is positioned
-    relative to pre-existing LV/RV geometry.
-    """
+def _make_image_grid(bounds, spacing: float) -> pv.ImageData:
+    xmin, xmax, ymin, ymax, zmin, zmax = bounds
+    dims = (
+        int(np.ceil((xmax - xmin) / spacing)) + 1,
+        int(np.ceil((ymax - ymin) / spacing)) + 1,
+        int(np.ceil((zmax - zmin) / spacing)) + 1,
+    )
+    return pv.ImageData(dimensions=dims, spacing=(spacing, spacing, spacing), origin=(xmin, ymin, zmin))
 
-    lv_epi = lv_result["epi_mesh"]
-    rv_epi = rv_result["epi_mesh"]
-
-    # Determine where top of LV is:
-    z_base = float(lv_epi.bounds[5])  # zmax
-
-    # Find the radius of LA to match th half-span of the LVL
-    x0, x1 = lv_epi.bounds[0:2]
-    R_base = 0.5 * (x1 - x0)
-
-    # Find the center of RV mesh:
-    rv_cx = float(rv_epi.center[1])
-    if rv_cx > 0:
-        lv_sign = -1.0
-    else:
-        lv_sign = 1.0
-
-    # Define minor axes stretch:
-    ax = r_scale_xy[0] * R_base
-    by = r_scale_xy[1] * R_base
-    cz = r_scale_z * R_base
-
-    # Define centroid:
-    cx = center_offset_xy[0] * R_base
-    cy = lv_sign * center_offset_xy[1] * R_base
-    cz0 = z_base + center_offset_z * R_base
-
-    z_av = z_base + av_plane_offset  # cushion
-
-    # Inner ellipsoid radii (wall thickness)
-    ax_i = max(ax - wall_thickness, 0)
-    by_i = max(by - wall_thickness, 0)
-    cz_i = max(cz - wall_thickness, 0)
-
-    # Build a voxel grid that covers LA domain with a small margin:
-    margin = 2.0 * spacing + 0.35 * R_base
-    xmin = cx - ax - margin
-    xmax = cx + ax + margin
-    ymin = cy - by - margin
-    ymax = cy + by + margin
-    zmin = z_av - margin
-    zmax = cz0 + cz + margin
-
-    # Specify the length of the grid in (x,y,z) respectively:
-    dims = (int(np.ceil((xmax - xmin) / spacing)) + 1, int(np.ceil((ymax - ymin) / spacing)) + 1, int(np.ceil((zmax - zmin) / spacing)) + 1)
-
-    # Create the voxel grid:
-    grid = pv.ImageData(dimensions=dims, spacing=(spacing, spacing, spacing), origin=(xmin, ymin, zmin))
-
-    # Grid point coordinates (N x 3)
+def _la_solid_mask(
+    grid: pv.ImageData,
+    cx, cy, cz0,
+    ax, by, cz,
+    R_base: float,
+    clearance: float,
+    x_side: float,
+    y_bias: float,
+    add_pulmonary_veins: bool = True,
+):
     X = grid.points[:, 0]
     Y = grid.points[:, 1]
     Z = grid.points[:, 2]
 
-
-    # Ellipsoid implicit functions:
-    # F = (x/a)^2 + (y/b)^2 + (z/c)^2 - 1
+    # Filled ellipsoid: (x/a)^2 + (y/b)^2 + (z/c)^2 <= 1
     xo = (X - cx) / ax
     yo = (Y - cy) / by
     zo = (Z - cz0) / cz
-    F_outer = xo ** 2 + yo ** 2 + zo **2 - 1.0
+    inside_ellipsoid = (xo**2 + yo**2 + zo**2) <= 1.0
 
-    xi = (X - cx) / ax_i
-    yi = (Y - cy) / by_i
-    zi = (Z - cz0) / cz_i
-    F_inner = xi **2 + yi **2 + zi ** 2 - 1.0
+    if not add_pulmonary_veins:
+        return inside_ellipsoid
 
-    inside_outer = F_outer <= 0.0
-    inside_inner = F_inner <= 0.0
+    # --- Pulmonary veins as filled cylinders (we'll build outer & inner separately outside) ---
+    pv_outer_radius = 0.18 * R_base
+    pv_length = 1.5 * R_base
+    posterior_tilt_deg = 35.0
+    phi = posterior_tilt_deg * np.pi / 180
 
-    la_shell = inside_outer & (~inside_inner)
-
-    # Generate pulmonary vessels
-    pv_outer_radius = 0.18 * R_base  # outer radius (thickness included)
-    pv_wall_thickness = 0.06 * R_base  # tube wall thickness
-    pv_inner_radius = max(pv_outer_radius - pv_wall_thickness, 1e-6)
-
-    pv_length = 1.5 * R_base  # length vein extrudes from LA
-
-    posterior_tilt_deg = 35.0  # angular orientation of vessels
-    phi = posterior_tilt_deg * np.pi / 180  # convert angle in degrees to radians
-
-    # Specify direction of veins:
     axis_R = np.array([ np.cos(phi), -np.sin(phi), 0.0], dtype=np.float32)
     axis_L = np.array([-np.cos(phi), -np.sin(phi), 0.0], dtype=np.float32)
-    axis_R /= np.linalg.norm(axis_R)  # normalize to unit length
-    axis_L /= np.linalg.norm(axis_L)  # normalize to unit length
+    axis_R /= np.linalg.norm(axis_R)
+    axis_L /= np.linalg.norm(axis_L)
 
-    # Attachment height on LA
     z_attach = cz0 + 0.25 * cz
-
-
-    # Spacing for pulmonary veins (prevent collisions)
     z_sep = clearance * (2.0 * pv_outer_radius)
-    z_sep = min(z_sep, 0.45 * cz)  # constrain separation to "fit" in LA
+    z_sep = min(z_sep, 0.45 * cz)
 
-    '''How far to place the inlets from LA center:
-    #x_side = 0.75 * ax 
-    #y_bias = -0.40 * by
-    Now keyword argument
-    '''
-
-    # define centers of each vessel:
     attach_L_sup = (cx - x_side, cy + y_bias, z_attach + 0.5 * z_sep)
     attach_L_inf = (cx - x_side, cy + y_bias, z_attach - 0.5 * z_sep)
     attach_R_sup = (cx + x_side, cy + y_bias, z_attach + 0.5 * z_sep)
     attach_R_inf = (cx + x_side, cy + y_bias, z_attach - 0.5 * z_sep)
 
-    # define tuples with (center, direction):
     pv_specs = [
         (attach_L_sup, axis_L),
         (attach_L_inf, axis_L),
@@ -520,100 +517,212 @@ def build_la_mesh(
         (attach_R_inf, axis_R),
     ]
 
-    pv_tube_mask = np.zeros_like(la_shell, dtype=bool)  # boolean array with the same shape as the la_shell
+    pv_mask = np.zeros_like(inside_ellipsoid, dtype=bool)
 
     for (p0_tuple, axis) in pv_specs:
         p0 = np.array(p0_tuple, dtype=np.float32)
+        p1 = p0 + pv_length * axis  # not explicitly used, but conceptually the segment end
 
-        # Segment endpoints
-        p1 = p0 + pv_length * axis
-
-        # Vector from p0 to each grid point
         vx = X - p0[0]
         vy = Y - p0[1]
         vz = Z - p0[2]
 
-        # Project onto axis, clamp to [0, pv_length]
         w_dot_a = vx * axis[0] + vy * axis[1] + vz * axis[2]
         t = np.clip(w_dot_a / pv_length, 0.0, 1.0)
 
-        # Closest point on the segment
         cxp = p0[0] + t * pv_length * axis[0]
         cyp = p0[1] + t * pv_length * axis[1]
         czp = p0[2] + t * pv_length * axis[2]
 
-        # Squared distance to centerline
         dx = X - cxp
         dy = Y - cyp
         dz = Z - czp
         r2 = dx*dx + dy*dy + dz*dz
 
-        inside_outer_cyl = (r2 <= pv_outer_radius * pv_outer_radius)
-        inside_inner_cyl = (r2 <= pv_inner_radius * pv_inner_radius)
+        pv_mask |= (r2 <= pv_outer_radius * pv_outer_radius)
 
-        # Tube wall occupancy
-        pv_tube_mask |= (inside_outer_cyl & (~inside_inner_cyl))
+    # Union: solid atrium + solid PVs
+    return inside_ellipsoid | pv_mask
 
-    # Union veins into the LA shell occupancy
-    la_shell = la_shell | pv_tube_mask
+def build_la_mesh(
+        lv_result: dict,
+        rv_result: dict,
+        spacing: float = 0.05,
+        r_scale_xy: tuple[float, float] = (0.72, 0.62),
+        r_scale_z: float = 0.58,
+        center_offset_xy: tuple[float, float] = (0.28, 0.62),
+        center_offset_z: float = 0.72,
+        av_plane_offset: float = 0.08,
+        wall_thickness: float = 0.16,
+        smooth_iters: int = 30,
+        # PV geometry
+        pv_outer_radius_scale: float = 0.18,  # * R_base
+        pv_wall_thickness_scale: float = 0.06,  # * R_base (used only if you later want a PV "shell")
+        pv_length_scale: float = 0.7,  # * R_base
+        # PV placement angles (slider-friendly), radians:
+        pv_L_sup_uv: tuple[float, float] = (np.pi * 0.80, np.pi * 0.10),
+        pv_L_inf_uv: tuple[float, float] = (np.pi * 0.80, -np.pi * 0.05),
+        pv_R_sup_uv: tuple[float, float] = (np.pi * 0.20, np.pi * 0.10),
+        pv_R_inf_uv: tuple[float, float] = (np.pi * 0.20, -np.pi * 0.05),
+        # Small push so the tube starts just outside the surface (prevents “inward” artifacts)
+        pv_start_offset: float = 0.5,  # in units of (voxel spacing)
+) -> dict:
+    lv_epi = lv_result["epi_mesh"]
+    rv_epi = rv_result["epi_mesh"]
 
-    # Store as scalar field and extract an isosurface
-    # Use float scalars for contouring: 1.0 inside shell, 0.0 outside
-    scalars = la_shell.astype(np.float32)
-    grid.point_data["la"] = scalars
+    z_base = float(lv_epi.bounds[5])
+    x0, x1 = lv_epi.bounds[0:2]
+    R_base = 0.5 * (x1 - x0)
 
-    # Extract surface with marching cubes
-    # Contour at 0.5 between 0 and 1
-    surf = grid.contour(isosurfaces=[0.5], scalars="la")
+    rv_cx = float(rv_epi.center[1])
+    lv_sign = -1.0 if rv_cx > 0 else 1.0
 
-    # Clean and triangulate
-    surf = surf.triangulate().clean(tolerance=1e-7)
+    ax = r_scale_xy[0] * R_base
+    by = r_scale_xy[1] * R_base
+    cz = r_scale_z * R_base
 
-    # Smoothing:
-    surf = surf.smooth(n_iter=30, relaxation_factor=0.05, feature_smoothing=False, boundary_smoothing=True)
+    cx = center_offset_xy[0] * R_base
+    cy = lv_sign * center_offset_xy[1] * R_base
+    cz0 = z_base + center_offset_z * R_base
 
-    # Recompute normals:
-    surf = surf.compute_normals(auto_orient_normals=True, consistent_normals=True)
+    ax_i = max(ax - wall_thickness, 1e-6)
+    by_i = max(by - wall_thickness, 1e-6)
+    cz_i = max(cz - wall_thickness, 1e-6)
 
-    return surf
+    z_av = z_base + av_plane_offset
+
+    margin = 2.0 * spacing + 0.35 * R_base
+    bounds = (
+        cx - ax - margin, cx + ax + margin,
+        cy - by - margin, cy + by + margin,
+        z_av - margin, cz0 + cz + margin
+    )
+    grid = _make_image_grid(bounds, spacing)
+
+    # Build filled atrial solids:
+    # outer ellipsoid filled
+    X = grid.points[:, 0]
+    Y = grid.points[:, 1]
+    Z = grid.points[:, 2]
+    xo = (X - cx) / ax
+    yo = (Y - cy) / by
+    zo = (Z - cz0) / cz
+    outer_solid = (xo ** 2 + yo ** 2 + zo ** 2) <= 1.0
+
+    xi = (X - cx) / ax_i
+    yi = (Y - cy) / by_i
+    zi = (Z - cz0) / cz_i
+    inner_solid = (xi ** 2 + yi ** 2 + zi ** 2) <= 1.0
+
+    # --- PV cylinders: choose surface points, aim along outward normal ---
+    pv_outer_radius = pv_outer_radius_scale * R_base
+    pv_length = pv_length_scale * R_base
+
+    pv_uvs = [pv_L_sup_uv, pv_L_inf_uv, pv_R_sup_uv, pv_R_inf_uv]
+    cylinders_outer = []
+    cylinders_inner = []
+
+    start_eps = pv_start_offset * spacing
+
+    for (u, v) in pv_uvs:
+        # On outer surface
+        p_outer = ellipsoid_surface_point(cx, cy, cz0, ax, by, cz, u, v)
+        n_outer = ellipsoid_outward_normal_at_point(cx, cy, cz0, ax, by, cz, p_outer)
+
+        # Start slightly outside the surface to extrude outward
+        p0_outer = p_outer + start_eps * n_outer
+        cylinders_outer.append((p0_outer, n_outer))
+
+        # On inner surface (so the endo cavity also includes PV inlets)
+        p_inner = ellipsoid_surface_point(cx, cy, cz0, ax_i, by_i, cz_i, u, v)
+        n_inner = ellipsoid_outward_normal_at_point(cx, cy, cz0, ax_i, by_i, cz_i, p_inner)
+        p0_inner = p_inner + start_eps * n_inner
+        cylinders_inner.append((p0_inner, n_inner))
+
+    # Union PVs into both solids
+    outer_solid = add_cylinders_to_mask(grid, outer_solid, cylinders_outer, pv_outer_radius, pv_length)
+    inner_solid = add_cylinders_to_mask(grid, inner_solid, cylinders_inner,
+                                        max(pv_outer_radius - pv_wall_thickness_scale * R_base, 1e-6), pv_length)
+
+    # Extract meshes:
+    grid.point_data["outer"] = outer_solid.astype(np.float32)
+    epi = grid.contour([0.5], scalars="outer").triangulate().clean(tolerance=1e-7)
+
+    grid.point_data["inner"] = inner_solid.astype(np.float32)
+    endo = grid.contour([0.5], scalars="inner").triangulate().clean(tolerance=1e-7)
+
+    if smooth_iters and smooth_iters > 0:
+        epi = epi.smooth(n_iter=smooth_iters, relaxation_factor=0.05,
+                         feature_smoothing=False, boundary_smoothing=True)
+        endo = endo.smooth(n_iter=smooth_iters, relaxation_factor=0.05,
+                           feature_smoothing=False, boundary_smoothing=True)
+
+    epi = epi.compute_normals(auto_orient_normals=True, consistent_normals=True)
+    endo = endo.compute_normals(auto_orient_normals=True, consistent_normals=True)
+
+    return {
+        "endo_mesh": endo,
+        "epi_mesh": epi,
+        "pv_specs": {
+            "uvs": pv_uvs,
+            "cylinders_outer": cylinders_outer,
+            "cylinders_inner": cylinders_inner,
+            "pv_outer_radius": pv_outer_radius,
+            "pv_length": pv_length,
+        },
+        "params": {
+            "center": (cx, cy, cz0),
+            "radii_outer": (ax, by, cz),
+            "radii_inner": (ax_i, by_i, cz_i),
+            "R_base": R_base,
+        }
+    }
 
 def build_ra_mesh(
-    lv_result: dict,
-    rv_result: dict,
-    la_mesh: pv.PolyData | None = None,   # <-- pass your LA surface here to enforce clearance
-    spacing: float = 0.05,
-    # RA ellipsoid
-    r_scale_xy: tuple[float, float] = (0.74, 0.64),
-    r_scale_z: float = 0.82,
-    # Placement
-    center_offset_xy: tuple[float, float] = (0.18, 0.44),  # push RA further to the RV side vs LA
-    center_offset_z: float = 0.85,
-    av_plane_offset: float = 0.06,
-    wall_thickness: float = 0.18,
-    # Prevent RA–LA intersection
-    la_clearance: float = 0.10,   # in units of R_base; increase if still intersecting
-    # Vena cavae:
-    vc_outer_radius: float | None = None,
-    vc_wall_thickness: float | None = None,
-    vc_length_sup: float = 1.7,   # in units of R_base
-    vc_length_inf: float = 1.5,   # in units of R_base
-    # Tilt controls for IVC
-    tilt_deg_sup: float = 15.0,
-    tilt_deg_inf: float = 45.0,
-    # Bias both SVC and IVC in -y direction so IVC does not intersect the RV
-    posterior_bias_deg: float = 18.0,
-) -> pv.PolyData:
+        lv_result: dict,
+        rv_result: dict,
+        la_mesh: pv.PolyData | None = None,  # LA surface for clearance
+        spacing: float = 0.05,
+        # RA ellipsoid
+        r_scale_xy: tuple[float, float] = (0.74, 0.64),
+        r_scale_z: float = 0.52,
+        # Placement
+        center_offset_xy: tuple[float, float] = (0.18, 0.44),
+        center_offset_z: float = 0.85,
+        av_plane_offset: float = 0.06,
+        wall_thickness: float = 0.18,
+        # Prevent RA–LA intersection
+        la_clearance: float = 0.10,  # in units of R_base
+        # Vena cavae geometry (units of R_base via *_scale)
+        vc_outer_radius_scale: float = 0.20,
+        vc_wall_thickness_scale: float = 0.06,
+        vc_length_sup_scale: float = 0.7,
+        vc_length_inf_scale: float = 0.5,
+
+        # Vena cavae placement on RA surface radians:
+        svc_uv: tuple[float, float] = (np.pi * 0.50, np.pi * 0.30),
+        ivc_uv: tuple[float, float] = (np.pi * 0.55, -np.pi * 0.25),
+        # Small push so tube starts outside surface
+        vc_start_offset: float = 0.5,  # in units of spacing
+        smooth_iters: int = 30,
+) -> dict:
     """
-    RA as an implicit ellipsoidal shell + SVC/IVC cylindrical shells.
+    Build RA as two meshes (endo/epi) from voxelized implicit solids:
+      - Epicardium: outer ellipsoid + SVC/IVC (filled cylinders)
+      - Endocardium: inner ellipsoid + inner SVC/IVC (filled cylinders)
+    Vena cavae are oriented along the outward normal of the RA ellipsoid at the
+    chosen attachment points (svc_uv, ivc_uv).
+
+    Returns dict: {"endo_mesh": ..., "epi_mesh": ..., "params": ..., "vc_specs": ...}
     """
     lv_epi = lv_result["epi_mesh"]
     rv_epi = rv_result["epi_mesh"]
 
-    z_base = float(lv_epi.bounds[5])  # zmax
+    z_base = float(lv_epi.bounds[5])
     x0, x1 = lv_epi.bounds[0:2]
     R_base = 0.5 * (x1 - x0)
 
-    # RV side sign (use RV center y)
+    # Determine RA side from RV center y
     rv_cy = float(rv_epi.center[1])
     ra_sign_y = 1.0 if rv_cy >= 0 else -1.0
 
@@ -622,135 +731,124 @@ def build_ra_mesh(
     by = r_scale_xy[1] * R_base
     cz = r_scale_z * R_base
 
-    # RA centroid (push to RV side)
+    # RA centroid
     cx = center_offset_xy[0] * R_base
     cy = ra_sign_y * center_offset_xy[1] * R_base
     cz0 = z_base + center_offset_z * R_base
 
     z_av = z_base + av_plane_offset
 
+    # Inner radii
     ax_i = max(ax - wall_thickness, 1e-6)
     by_i = max(by - wall_thickness, 1e-6)
     cz_i = max(cz - wall_thickness, 1e-6)
 
-    if vc_outer_radius is None:
-        vc_outer_radius = 0.20 * R_base
-    if vc_wall_thickness is None:
-        vc_wall_thickness = 0.06 * R_base
+    # Vena cavae radii/lengths
+    vc_outer_radius = vc_outer_radius_scale * R_base
+    vc_wall_thickness = vc_wall_thickness_scale * R_base
     vc_inner_radius = max(vc_outer_radius - vc_wall_thickness, 1e-6)
+    L_sup = vc_length_sup_scale * R_base
+    L_inf = vc_length_inf_scale * R_base
 
-    # Grid bounds (include SVC/IVC extents)
+    # Grid bounds (include SVC/IVC extents along z; conservative)
     margin = 2.0 * spacing + 0.45 * R_base
-    xmin = cx - ax - margin
-    xmax = cx + ax + margin
-    ymin = cy - by - margin
-    ymax = cy + by + margin
-    zmin = z_av - margin - vc_length_inf * R_base
-    zmax = cz0 + cz + margin + vc_length_sup * R_base
-
-    dims = (
-        int(np.ceil((xmax - xmin) / spacing)) + 1,
-        int(np.ceil((ymax - ymin) / spacing)) + 1,
-        int(np.ceil((zmax - zmin) / spacing)) + 1,
+    bounds = (
+        cx - ax - margin, cx + ax + margin,
+        cy - by - margin, cy + by + margin,
+        (z_av - margin - L_inf), (cz0 + cz + margin + L_sup),
     )
-    grid = pv.ImageData(dimensions=dims, spacing=(spacing, spacing, spacing), origin=(xmin, ymin, zmin))
+    grid = _make_image_grid(bounds, spacing)
 
+    # Build filled ellipsoid solids, clipped by AV plane
     X = grid.points[:, 0]
     Y = grid.points[:, 1]
     Z = grid.points[:, 2]
 
-    # RA ellipsoidal shell
     xo = (X - cx) / ax
     yo = (Y - cy) / by
     zo = (Z - cz0) / cz
-    F_outer = xo * xo + yo * yo + zo * zo - 1.0
+    outer_solid = (xo ** 2 + yo ** 2 + zo ** 2) <= 1.0
+    outer_solid &= (Z >= z_av)
 
     xi = (X - cx) / ax_i
     yi = (Y - cy) / by_i
     zi = (Z - cz0) / cz_i
-    F_inner = xi * xi + yi * yi + zi * zi - 1.0
+    inner_solid = (xi ** 2 + yi ** 2 + zi ** 2) <= 1.0
+    inner_solid &= (Z >= z_av)
 
-    inside_outer = (F_outer <= 0.0) & (Z >= z_av)
-    inside_inner = (F_inner <= 0.0) & (Z >= z_av)
-    ra_shell = inside_outer & (~inside_inner)
+    # --- Compute SVC/IVC attachments and normal directions on the ellipsoid ---
+    start_eps = vc_start_offset * spacing
 
-    # Vena cavae directions:
-    def unit(v):
-        v = np.asarray(v, dtype=np.float32)
-        n = np.linalg.norm(v)
-        return v / (n if n > 0 else 1.0)
+    def vc_attachment_and_axis(ax_, by_, cz_, uv):
+        u, v = uv
+        p = ellipsoid_surface_point(cx, cy, cz0, ax_, by_, cz_, u, v)
+        n = ellipsoid_outward_normal_at_point(cx, cy, cz0, ax_, by_, cz_, p)
+        p0 = p + start_eps * n
+        return p0, n
 
-    # Posterior (-y):
-    post = np.deg2rad(posterior_bias_deg)
+    # Outer (epi) attachments/axes
+    svc_p0_o, svc_axis_o = vc_attachment_and_axis(ax, by, cz, svc_uv)
+    ivc_p0_o, ivc_axis_o = vc_attachment_and_axis(ax, by, cz, ivc_uv)
 
-    # SVC:
-    axis_sup = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    # Inner (endo) attachments/axes (so endo also includes inlets)
+    svc_p0_i, svc_axis_i = vc_attachment_and_axis(ax_i, by_i, cz_i, svc_uv)
+    ivc_p0_i, ivc_axis_i = vc_attachment_and_axis(ax_i, by_i, cz_i, ivc_uv)
 
-    # IVC:
-    ti = np.deg2rad(tilt_deg_inf)
-    axis_inf = unit([np.sin(ti), -np.sin(post), -np.cos(ti)])
+    # Add filled cylinders into solids
+    outer_solid = add_cylinders_to_mask(
+        grid, outer_solid,
+        cylinders=[(svc_p0_o, svc_axis_o), (ivc_p0_o, ivc_axis_o)],
+        radius=vc_outer_radius, length=max(L_sup, L_inf)  # length handled by clamp; see note below
+    )
+    outer_solid = add_cylinders_to_mask(grid, outer_solid, [(svc_p0_o, svc_axis_o)], vc_outer_radius, L_sup)
+    outer_solid = add_cylinders_to_mask(grid, outer_solid, [(ivc_p0_o, ivc_axis_o)], vc_outer_radius, L_inf)
 
-    # Move attachments
-    # Posterior shift applies ONLY to IVC
-    y_post_shift = -0.25 * by
-    x_shift = 0.10 * ax
+    inner_solid = add_cylinders_to_mask(grid, inner_solid, [(svc_p0_i, svc_axis_i)], vc_inner_radius, L_sup)
+    inner_solid = add_cylinders_to_mask(grid, inner_solid, [(ivc_p0_i, ivc_axis_i)], vc_inner_radius, L_inf)
 
-    # Attachment heights
-    z_attach_sup = cz0 + 0.60 * cz
-    z_attach_inf = cz0 - 0.50 * cz
-
-    # SVC:
-    p_attach_sup = np.array([cx, cy, z_attach_sup], dtype=np.float32)
-
-    # IVC:
-    p_attach_inf = np.array([cx + x_shift, cy + y_post_shift, z_attach_inf], dtype=np.float32)
-
-    def add_tube_shell(mask: np.ndarray, p0: np.ndarray, axis: np.ndarray, length_Rb: float):
-        L = float(length_Rb) * R_base
-        vx = X - p0[0]
-        vy = Y - p0[1]
-        vz = Z - p0[2]
-        w = vx * axis[0] + vy * axis[1] + vz * axis[2]
-        t = np.clip(w / L, 0.0, 1.0)
-
-        cxp = p0[0] + t * L * axis[0]
-        cyp = p0[1] + t * L * axis[1]
-        czp = p0[2] + t * L * axis[2]
-
-        dx = X - cxp
-        dy = Y - cyp
-        dz = Z - czp
-        r2 = dx * dx + dy * dy + dz * dz
-
-        inside_outer_cyl = (r2 <= vc_outer_radius * vc_outer_radius)
-        inside_inner_cyl = (r2 <= vc_inner_radius * vc_inner_radius)
-        return mask | (inside_outer_cyl & (~inside_inner_cyl))
-
-    tube_mask = np.zeros_like(ra_shell, dtype=bool)
-    tube_mask = add_tube_shell(tube_mask, p_attach_sup, axis_sup, vc_length_sup)
-    tube_mask = add_tube_shell(tube_mask, p_attach_inf, axis_inf, vc_length_inf)
-
-    ra_shell = ra_shell | tube_mask
-
-    # Carve out ra if intersecting la
+    # Carve RA voxels too close to LA
     if la_mesh is not None and la_clearance > 0:
-        # Distance from each voxel point to LA surface
-        poly = la_mesh
-        # Use pointset distance (fast enough for moderate grids)
         pts = pv.PolyData(grid.points)
-        d = pts.compute_implicit_distance(poly)["implicit_distance"]  # signed distance; |d| is distance
-        # Remove RA voxels that are within clearance of LA surface or inside LA (negative distance)
+        d = pts.compute_implicit_distance(la_mesh)["implicit_distance"]
         carve = d <= (la_clearance * R_base)
-        ra_shell = ra_shell & (~carve)
+        outer_solid &= (~carve)
+        inner_solid &= (~carve)
 
-    # Extract isosurface
-    grid.point_data["ra"] = ra_shell.astype(np.float32)
-    surf = grid.contour(isosurfaces=[0.5], scalars="ra")
-    surf = surf.triangulate().clean(tolerance=1e-7)
-    surf = surf.smooth(n_iter=30, relaxation_factor=0.05, feature_smoothing=False, boundary_smoothing=True)
-    surf = surf.compute_normals(auto_orient_normals=True, consistent_normals=True)
+    # Extract meshes
+    grid.point_data["ra_outer"] = outer_solid.astype(np.float32)
+    epi = grid.contour([0.5], scalars="ra_outer").triangulate().clean(tolerance=1e-7)
 
-    return surf
+    grid.point_data["ra_inner"] = inner_solid.astype(np.float32)
+    endo = grid.contour([0.5], scalars="ra_inner").triangulate().clean(tolerance=1e-7)
+
+    if smooth_iters and smooth_iters > 0:
+        epi = epi.smooth(n_iter=smooth_iters, relaxation_factor=0.05,
+                         feature_smoothing=False, boundary_smoothing=True)
+        endo = endo.smooth(n_iter=smooth_iters, relaxation_factor=0.05,
+                           feature_smoothing=False, boundary_smoothing=True)
+
+    epi = epi.compute_normals(auto_orient_normals=True, consistent_normals=True)
+    endo = endo.compute_normals(auto_orient_normals=True, consistent_normals=True)
+
+    return {
+        "endo_mesh": endo,
+        "epi_mesh": epi,
+        "vc_specs": {
+            "svc_uv": svc_uv,
+            "ivc_uv": ivc_uv,
+            "svc_outer": (svc_p0_o, svc_axis_o, vc_outer_radius, L_sup),
+            "ivc_outer": (ivc_p0_o, ivc_axis_o, vc_outer_radius, L_inf),
+            "svc_inner": (svc_p0_i, svc_axis_i, vc_inner_radius, L_sup),
+            "ivc_inner": (ivc_p0_i, ivc_axis_i, vc_inner_radius, L_inf),
+        },
+        "params": {
+            "center": (cx, cy, cz0),
+            "radii_outer": (ax, by, cz),
+            "radii_inner": (ax_i, by_i, cz_i),
+            "R_base": R_base,
+            "z_av": z_av,
+        }
+    }
 
 def build_pulmonary_trunk(
     rv_result: dict,
@@ -763,7 +861,7 @@ def build_pulmonary_trunk(
     z_offset: float = -0.02,
     slab_tol: float = 0.03,
     safety: float = 0.98,
-    xy_bias: tuple[float, float] = (-0.8, 0.45),
+    xy_bias: tuple[float, float] = (0.0, 0.45),
 ) -> dict:
     rv_endo = rv_result["endo_mesh"]
 
@@ -898,7 +996,7 @@ def build_aorta(
     lv_result: dict,
     outer_radius: float = 0.48,
     wall_thickness: float = 0.10,
-    straight_up: float = 2.0,  # ascending aorta length
+    straight_up: float = 1.2,  # ascending aorta length
     arch_radius: float = 1.8,  # radius of arched portion
     arch_angle_deg: float = 165.0,
     end_straight: float = 0.8,  # descending aorta length
@@ -1133,9 +1231,11 @@ def visualize_geometry():
     ])
     plotter.add_mesh(pv.lines_from_points(rv_epi_3d), color="steelblue", line_width=4)
 
-    plotter.add_mesh(la_mesh, color="goldenrod", opacity=0.6)
+    plotter.add_mesh(la_mesh['endo_mesh'], color="darkgoldenrod", opacity=0.7)
+    plotter.add_mesh(la_mesh['epi_mesh'], color="goldenrod", opacity=0.4)
 
-    plotter.add_mesh(ra_mesh, color="darkviolet", opacity=0.6)
+    plotter.add_mesh(ra_mesh['endo_mesh'], color="darkviolet", opacity=0.7)
+    plotter.add_mesh(ra_mesh['epi_mesh'], color="violet", opacity=0.4)
 
     plotter.add_mesh(pv.lines_from_points(pulm["centerline"]), color="darkgreen", line_width=3)
     plotter.add_mesh(pulm["mesh"], color="darkgreen", line_width=3)
